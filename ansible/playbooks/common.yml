@@ -1,0 +1,22 @@
+# =============================================================================
+# FILE: playbooks/common.yml
+# PURPOSE: Runs common configuration on every VM in the pipeline.
+#          Always runs before service-specific playbooks in the workflow.
+#
+# TARGETS:
+#   hosts: vms — the [vms:children] group in hosts.ini which contains
+#   every role group as a child. This means every VM gets common config
+#   regardless of what role it has.
+# =============================================================================
+ 
+---
+- name: Apply common configuration to all Linux VMs
+  hosts: vms
+  become: true
+  roles:
+    - common
+
+
+
+
+    

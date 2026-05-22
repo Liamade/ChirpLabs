@@ -1,0 +1,857 @@
+# Configures the SecMonDock VM — mounts the persistent data disk, sets up Docker
+# storage on that disk, deploys all compose stacks, and brings them up in order.
+#
+# Startup order matters: security-core (Graylog + Wazuh) must be ready before
+# the other stacks come up. Everything waits on Graylog port 9000.
+#
+# Variables from group_vars/secmondock.yml. Secrets injected via -e at runtime.
+
+# install dependencies
+
+- name: Install supporting tools
+  ansible.builtin.apt:
+    name:
+      - git
+      - python3-pip
+      - rsync
+      - curl
+    state: present
+    update_cache: true
+
+- name: Install Docker SDK for Python
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+
+- name: Ensure Docker is running
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+# find and mount persistent data disk
+# uses UUID so device name changes (/dev/sdb vs /dev/sdc) don't matter
+
+- name: Find data disk device by UUID
+  ansible.builtin.shell: blkid -U {{ secmondock_disk_uuid }}
+  register: data_disk_found
+  changed_when: false
+  failed_when: false
+
+- name: Reboot if data disk not detected
+  ansible.builtin.reboot:
+    reboot_timeout: 120
+  when: data_disk_found.stdout == ""
+
+- name: Re-detect data disk after reboot
+  ansible.builtin.shell: blkid -U {{ secmondock_disk_uuid }}
+  register: data_disk_after_reboot
+  changed_when: false
+  when: data_disk_found.stdout == ""
+
+- name: Set data disk device variable
+  ansible.builtin.set_fact:
+    data_disk_device: >-
+      {{ data_disk_after_reboot.stdout
+         if (data_disk_found.stdout == '' and data_disk_after_reboot is not skipped)
+         else data_disk_found.stdout }}
+
+- name: Check for existing filesystem on data disk
+  ansible.builtin.shell: blkid {{ data_disk_device }} | grep -c TYPE || true
+  register: disk_fs
+  changed_when: false
+  failed_when: false
+
+- name: Check if disk is already mounted
+  ansible.builtin.command: mountpoint -q {{ secmondock_data_path }}
+  register: already_mounted
+  changed_when: false
+  failed_when: false
+
+- name: Format data disk as ext4 (first run only — skipped on rebuilds)
+  ansible.builtin.filesystem:
+    fstype: ext4
+    dev: "{{ data_disk_device }}"
+  when:
+    - disk_fs.stdout == ""
+    - already_mounted.rc != 0
+
+- name: Create /mnt/data mount point
+  ansible.builtin.file:
+    path: "{{ secmondock_data_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Mount persistent disk at /mnt/data
+  ansible.builtin.mount:
+    path: "{{ secmondock_data_path }}"
+    src: "UUID={{ secmondock_disk_uuid }}"
+    fstype: ext4
+    opts: defaults
+    state: mounted
+
+# redirect Docker and containerd storage to the persistent disk
+# keeps the 10GB boot disk from filling up with container images
+
+- name: Create Docker data directory on persistent disk
+  ansible.builtin.file:
+    path: /mnt/data/docker
+    state: directory
+    owner: root
+    group: root
+    mode: '0711'
+
+- name: Create containerd data directory on persistent disk
+  ansible.builtin.file:
+    path: /mnt/data/docker/containerd
+    state: directory
+    owner: root
+    group: root
+    mode: '0711'
+
+- name: Configure Docker to use persistent disk for image storage
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "data-root": "/mnt/data/docker"
+      }
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Configure containerd to use persistent disk
+  ansible.builtin.copy:
+    dest: /etc/containerd/config.toml
+    content: |
+      version = 2
+      root = "/mnt/data/docker/containerd"
+      [plugins."io.containerd.grpc.v1.cri"]
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          snapshotter = "overlayfs"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create Docker systemd override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Ensure Docker waits for data disk mount
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker.service.d/mount-order.conf
+    content: |
+      [Unit]
+      After=mnt-data.mount
+      Requires=mnt-data.mount
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart containerd with new config
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+
+- name: Restart Docker with new data-root and mount ordering
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+
+# generate Wazuh SSL certificates (first run only — skipped if certs already exist)
+# uses openssl directly because the official wazuh-certs-generator image isn't on
+# Docker Hub for the version we're running
+
+- name: Check if Wazuh certs already exist
+  ansible.builtin.stat:
+    path: /mnt/data/wazuh/indexer/ssl-certs/root-ca.pem
+  register: wazuh_certs
+
+- name: Create Wazuh cert generation directory
+  ansible.builtin.file:
+    path: /tmp/wazuh-cert-gen
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: not wazuh_certs.stat.exists or wazuh_certs.stat.isdir
+
+- name: Generate Wazuh SSL certificates with openssl
+  ansible.builtin.shell: |
+    cd /tmp/wazuh-cert-gen
+
+    # Root CA
+    openssl genrsa -out root-ca-key.pem 2048
+    openssl req -new -x509 -key root-ca-key.pem -out root-ca.pem -days 3650 \
+      -subj "/CN=Wazuh Root CA/O=Wazuh"
+
+    # Indexer cert — must have DNS:wazuh.indexer SAN or manager TLS will reject it
+    openssl genrsa -out wazuh.indexer-key.pem 2048
+    openssl req -new -key wazuh.indexer-key.pem -out indexer.csr \
+      -subj "/CN=wazuh.indexer/O=Wazuh"
+    openssl x509 -req -in indexer.csr -CA root-ca.pem -CAkey root-ca-key.pem \
+      -CAcreateserial -out wazuh.indexer.pem -days 3650 \
+      -extfile <(printf "subjectAltName=DNS:wazuh.indexer,IP:127.0.0.1")
+
+    # Manager cert
+    openssl genrsa -out wazuh.manager-key.pem 2048
+    openssl req -new -key wazuh.manager-key.pem -out manager.csr \
+      -subj "/CN=wazuh.manager/O=Wazuh"
+    openssl x509 -req -in manager.csr -CA root-ca.pem -CAkey root-ca-key.pem \
+      -CAcreateserial -out wazuh.manager.pem -days 3650 \
+      -extfile <(printf "subjectAltName=DNS:wazuh.manager,IP:127.0.0.1")
+
+    # Dashboard cert
+    openssl genrsa -out wazuh.dashboard-key.pem 2048
+    openssl req -new -key wazuh.dashboard-key.pem -out dashboard.csr \
+      -subj "/CN=wazuh.dashboard/O=Wazuh"
+    openssl x509 -req -in dashboard.csr -CA root-ca.pem -CAkey root-ca-key.pem \
+      -CAcreateserial -out wazuh.dashboard.pem -days 3650 \
+      -extfile <(printf "subjectAltName=DNS:wazuh.dashboard,IP:127.0.0.1")
+
+    # Admin cert (required for indexer security plugin initialization)
+    openssl genrsa -out admin-key.pem 2048
+    openssl req -new -key admin-key.pem -out admin.csr \
+      -subj "/CN=admin/O=Wazuh"
+    openssl x509 -req -in admin.csr -CA root-ca.pem -CAkey root-ca-key.pem \
+      -CAcreateserial -out admin.pem -days 3650
+
+    # root-ca-manager.pem is the same CA — manager mounts it separately
+    cp root-ca.pem root-ca-manager.pem
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: not wazuh_certs.stat.exists or wazuh_certs.stat.isdir
+
+- name: Clean and copy Wazuh certs to persistent disk
+  ansible.builtin.shell: |
+    rm -rf /mnt/data/wazuh/indexer/ssl-certs/*
+    cp /tmp/wazuh-cert-gen/admin-key.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/admin.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/root-ca.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/root-ca-manager.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.indexer.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.indexer-key.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.manager.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.manager-key.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.dashboard.pem /mnt/data/wazuh/indexer/ssl-certs/
+    cp /tmp/wazuh-cert-gen/wazuh.dashboard-key.pem /mnt/data/wazuh/indexer/ssl-certs/
+  changed_when: true
+  when: not wazuh_certs.stat.exists or wazuh_certs.stat.isdir
+
+# set permissions — container processes run as specific UIDs, ownership must match
+
+- name: Set correct permissions on Shuffle data directory
+  ansible.builtin.file:
+    path: /mnt/data/shuffle
+    owner: '1000'
+    group: '1000'
+    recurse: true
+    mode: '0755'
+
+- name: Set correct permissions on Wazuh SSL certs directory
+  # Directory must be 755 or openssl/Docker bind mounts will get EACCES
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/indexer/ssl-certs
+    state: directory
+    mode: '0755'
+
+- name: Set correct permissions on Wazuh SSL cert files
+  ansible.builtin.shell: chmod 644 /mnt/data/wazuh/indexer/ssl-certs/*.pem
+  changed_when: false
+
+- name: Set correct permissions on Wazuh manager directories
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/manager
+    owner: '1000'
+    group: '999'
+    recurse: true
+    mode: '0770'
+
+- name: Set correct permissions on Wazuh indexer data directory
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/indexer/data
+    owner: '1000'
+    group: '1000'
+    recurse: true
+    mode: '0755'
+
+- name: Set correct permissions on Graylog data directory
+  ansible.builtin.file:
+    path: /mnt/data/graylog/data
+    owner: '1100'
+    group: '1100'
+    recurse: true
+
+- name: Ensure Wazuh manager shared directory exists with defaults
+  ansible.builtin.shell: |
+    if [ ! -f /mnt/data/wazuh/manager/etc/shared/ar.conf ]; then
+      docker run --rm \
+        -v /mnt/data/wazuh/manager/etc/shared:/dest \
+        --entrypoint /bin/bash \
+        wazuh/wazuh-manager:4.14.4 \
+        -c "cp -ar /var/ossec/etc/shared/. /dest/"
+      chown -R 1000:999 /mnt/data/wazuh/manager/etc/shared
+      chmod -R 770 /mnt/data/wazuh/manager/etc/shared
+    fi
+  changed_when: false
+
+# create service directories for compose files and configs
+
+- name: Create service directories
+  ansible.builtin.file:
+    path: "{{ secmondock_services_path }}/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - security-core
+    - misp
+    - shuffle
+    - prometheus
+
+- name: Create disk-backups directory on persistent disk
+  # Required by backuptodisk script — rsync will fail if this doesn't exist
+  ansible.builtin.file:
+    path: /mnt/data/disk-backups/services
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+# clone upstream repos
+
+- name: Clone MISP repo
+  ansible.builtin.git:
+    repo: https://github.com/MISP/misp-docker.git
+    dest: "{{ secmondock_services_path }}/misp"
+    version: master
+    force: true
+
+# template all config files
+# Wazuh configs go to /mnt/data/ (persistent), compose/env files go to /opt/services/ (ephemeral)
+
+- name: Check Graylog certs exist
+  ansible.builtin.stat:
+    path: /mnt/data/graylog/certs/rootCA.crt
+  register: graylog_certs
+
+- name: Fail if Graylog certs are missing
+  ansible.builtin.fail:
+    msg: >
+      Graylog certs are missing from /mnt/data/graylog/certs/.
+      Copy rootCA.crt, server.crt, server.key, server_pkcs8.key, and truststore.jks
+      from the original Graylog instance before running Ansible.
+  when: not graylog_certs.stat.exists
+
+- name: Check if opensearch.yml is a directory
+  ansible.builtin.stat:
+    path: /mnt/data/wazuh/indexer/config/opensearch.yml
+  register: opensearch_yml_stat
+
+- name: Remove opensearch.yml if it is a directory
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/indexer/config/opensearch.yml
+    state: absent
+  when: opensearch_yml_stat.stat.exists and opensearch_yml_stat.stat.isdir
+
+- name: Check if internal_users.yml is a directory
+  ansible.builtin.stat:
+    path: /mnt/data/wazuh/indexer/config/internal_users.yml
+  register: internal_users_stat
+
+- name: Remove internal_users.yml if it is a directory
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/indexer/config/internal_users.yml
+    state: absent
+  when: internal_users_stat.stat.exists and internal_users_stat.stat.isdir
+
+- name: Check if custom-misp.py is a directory
+  ansible.builtin.stat:
+    path: /mnt/data/wazuh/integration-scripts/scripts/custom-misp.py
+  register: custom_misp_stat
+
+- name: Remove custom-misp.py if it is a directory
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/integration-scripts/scripts/custom-misp.py
+    state: absent
+  when: custom_misp_stat.stat.exists and custom_misp_stat.stat.isdir
+
+# --- Wazuh persistent configs ---
+
+- name: Create Wazuh dashboard config directory
+  ansible.builtin.file:
+    path: /mnt/data/wazuh/dashboard/config-files
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Template Wazuh manager ossec.conf
+  ansible.builtin.template:
+    src: security-core/wazuh-ossec.conf.j2
+    dest: /mnt/data/wazuh/manager/etc/ossec.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Wazuh indexer opensearch config
+  ansible.builtin.template:
+    src: security-core/opensearch.yml.j2
+    dest: /mnt/data/wazuh/indexer/config/opensearch.yml
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Wazuh indexer internal users config
+  ansible.builtin.template:
+    src: security-core/internal_users.yml.j2
+    dest: /mnt/data/wazuh/indexer/config/internal_users.yml
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Wazuh dashboard opensearch_dashboards config
+  ansible.builtin.template:
+    src: security-core/opensearch_dashboards.yml.j2
+    dest: /mnt/data/wazuh/dashboard/config-files/opensearch_dashboards.yml
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Wazuh dashboard wazuh.yml config
+  ansible.builtin.template:
+    src: security-core/wazuh.yml.j2
+    dest: /mnt/data/wazuh/dashboard/config-files/wazuh.yml
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Wazuh integration custom-misp.py
+  ansible.builtin.template:
+    src: security-core/custom-misp.py.j2
+    dest: /mnt/data/wazuh/integration-scripts/scripts/custom-misp.py
+    owner: root
+    group: root
+    mode: '0755'
+
+# --- Compose and env files ---
+
+- name: Template security-core compose file
+  ansible.builtin.template:
+    src: security-core/docker-compose.yml.j2
+    dest: "{{ secmondock_services_path }}/security-core/docker-compose.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template security-core env file
+  ansible.builtin.template:
+    src: security-core/.env.j2
+    dest: "{{ secmondock_services_path }}/security-core/.env"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Check if filebeat.yml is a directory
+  ansible.builtin.stat:
+    path: "{{ secmondock_services_path }}/security-core/filebeat.yml"
+  register: filebeat_yml_stat
+
+- name: Remove filebeat.yml if it is a directory
+  ansible.builtin.file:
+    path: "{{ secmondock_services_path }}/security-core/filebeat.yml"
+    state: absent
+  when: filebeat_yml_stat.stat.exists and filebeat_yml_stat.stat.isdir
+
+- name: Template Filebeat config file
+  # This is the standalone wazuh-filebeat container that ships alerts to Graylog.
+  ansible.builtin.template:
+    src: security-core/filebeat.yml.j2
+    dest: "{{ secmondock_services_path }}/security-core/filebeat.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+
+- name: Template MISP compose file
+  ansible.builtin.template:
+    src: misp/docker-compose.yml.j2
+    dest: "{{ secmondock_services_path }}/misp/docker-compose.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template MISP env file
+  ansible.builtin.template:
+    src: misp/.env.j2
+    dest: "{{ secmondock_services_path }}/misp/.env"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Template Shuffle compose file
+  ansible.builtin.template:
+    src: shuffle/docker-compose.yml.j2
+    dest: "{{ secmondock_services_path }}/shuffle/docker-compose.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Shuffle env file
+  ansible.builtin.template:
+    src: shuffle/.env.j2
+    dest: "{{ secmondock_services_path }}/shuffle/.env"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Check if prometheus.yml is a directory
+  ansible.builtin.stat:
+    path: "{{ secmondock_services_path }}/prometheus/prometheus.yml"
+  register: prometheus_yml_stat
+
+- name: Remove prometheus.yml if it is a directory
+  ansible.builtin.file:
+    path: "{{ secmondock_services_path }}/prometheus/prometheus.yml"
+    state: absent
+  when: prometheus_yml_stat.stat.exists and prometheus_yml_stat.stat.isdir
+
+- name: Template Prometheus compose file
+  ansible.builtin.template:
+    src: prometheus/docker-compose.yml.j2
+    dest: "{{ secmondock_services_path }}/prometheus/docker-compose.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Template Prometheus config file
+  ansible.builtin.template:
+    src: prometheus/prometheus.yml.j2
+    dest: "{{ secmondock_services_path }}/prometheus/prometheus.yml"
+    owner: root
+    group: root
+    mode: '0644'
+
+# kernel parameters — OpenSearch requires vm.max_map_count >= 262144
+
+- name: Set vm.max_map_count for OpenSearch
+  ansible.builtin.sysctl:
+    name: vm.max_map_count
+    value: '262144'
+    state: present
+    reload: true
+
+# bring up stacks in order — recreate: always ensures containers pick up latest config
+
+- name: Bring up security-core (Graylog + Wazuh)
+  community.docker.docker_compose_v2:
+    project_src: "{{ secmondock_services_path }}/security-core"
+    state: present
+    recreate: always
+  register: security_core_result
+
+- name: Ensure Graylog inputs are set to RUNNING state
+  ansible.builtin.shell: >
+    docker exec security-core-mongodb-1 mongosh graylog
+    --eval 'db.inputs.updateMany({}, {"$set": {"desired_state": "RUNNING"}})'
+  changed_when: false
+  ignore_errors: true
+
+- name: Wait for Wazuh indexer to be ready
+  ansible.builtin.wait_for:
+    host: "{{ inventory_hostname }}"
+    port: 9201
+    delay: 15
+    timeout: 120
+
+- name: Check if Wazuh indexer data already exists
+  ansible.builtin.stat:
+    path: /mnt/data/wazuh/indexer/data/nodes
+  register: indexer_data
+
+- name: Wait additional time for indexer security plugin to initialize
+  ansible.builtin.pause:
+    seconds: 45
+  when: not indexer_data.stat.exists
+
+- name: Initialize Wazuh indexer security (first run only)
+  ansible.builtin.command: >
+    docker exec security-core-wazuh.indexer-1
+    bash -c "JAVA_HOME=/usr/share/wazuh-indexer/jdk
+    bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh
+    -cd /usr/share/wazuh-indexer/config/opensearch-security/
+    -nhnv
+    -cacert /usr/share/wazuh-indexer/config/certs/root-ca.pem
+    -cert /usr/share/wazuh-indexer/config/certs/admin.pem
+    -key /usr/share/wazuh-indexer/config/certs/admin-key.pem
+    -p 9200 -h 127.0.0.1"
+  changed_when: false
+  ignore_errors: true
+  when: not indexer_data.stat.exists
+  ignore_errors: true
+
+- name: Wait for Graylog to be ready before starting other stacks
+  ansible.builtin.wait_for:
+    host: "{{ inventory_hostname }}"
+    port: 9000
+    delay: 30
+    timeout: 300
+
+- name: Bring up MISP
+  community.docker.docker_compose_v2:
+    project_src: "{{ secmondock_services_path }}/misp"
+    state: present
+    recreate: always
+
+- name: Bring up Shuffle
+  community.docker.docker_compose_v2:
+    project_src: "{{ secmondock_services_path }}/shuffle"
+    state: present
+    recreate: always
+
+- name: Bring up Prometheus
+  community.docker.docker_compose_v2:
+    project_src: "{{ secmondock_services_path }}/prometheus"
+    state: present
+    recreate: always
+
+# verify all stacks are running — fail loudly if something didn't come up
+
+- name: Verify security-core containers are running
+  ansible.builtin.command: docker compose ps --services --filter status=running
+  args:
+    chdir: "{{ secmondock_services_path }}/security-core"
+  register: security_core_status
+  changed_when: false
+  failed_when: security_core_status.stdout == ""
+
+- name: Verify MISP containers are running
+  ansible.builtin.command: docker compose ps --services --filter status=running
+  args:
+    chdir: "{{ secmondock_services_path }}/misp"
+  register: misp_status
+  changed_when: false
+  failed_when: misp_status.stdout == ""
+
+- name: Verify Shuffle containers are running
+  ansible.builtin.command: docker compose ps --services --filter status=running
+  args:
+    chdir: "{{ secmondock_services_path }}/shuffle"
+  register: shuffle_status
+  changed_when: false
+  failed_when: shuffle_status.stdout == ""
+
+- name: Verify Prometheus is running
+  ansible.builtin.command: docker compose ps --services --filter status=running
+  args:
+    chdir: "{{ secmondock_services_path }}/prometheus"
+  register: prometheus_status
+  changed_when: false
+  failed_when: prometheus_status.stdout == ""
+
+# install management scripts
+
+- name: Install backuptodisk script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/backuptodisk
+    content: |
+      #!/bin/bash
+      echo "Syncing service configs to persistent disk..."
+      rsync -a {{ secmondock_services_path }}/ {{ secmondock_data_path }}/disk-backups/services/
+      echo "Done. Changes will survive the next VM rebuild."
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install stack management script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/stackctl
+    content: |
+      {% raw %}
+      #!/bin/bash
+      # ==========================================================
+      # stackctl — SecMonDock stack management script
+      # Usage:
+      #   stackctl start    — bring up all stacks in correct order
+      #   stackctl stop     — bring down all stacks cleanly
+      #   stackctl restart  — stop then start all stacks
+      #   stackctl status   — show running containers across all stacks
+      # ==========================================================
+
+      SERVICES_PATH="{% endraw %}{{ secmondock_services_path }}{% raw %}"
+
+      start_stacks() {
+        echo "==> Starting security-core (Graylog + Wazuh)..."
+        docker compose -f $SERVICES_PATH/security-core/docker-compose.yml up -d
+
+        echo "==> Waiting for Graylog to be ready (port 9000)..."
+        for i in $(seq 1 30); do
+          if curl -s -o /dev/null http://localhost:9000; then
+            echo "    Graylog is up."
+            break
+          fi
+          echo "    Waiting... ($i/30)"
+          sleep 10
+        done
+
+        echo "==> Starting MISP..."
+        docker compose -f $SERVICES_PATH/misp/docker-compose.yml up -d
+
+        echo "==> Waiting for MISP to be ready (port 8443)..."
+        for i in $(seq 1 30); do
+          if curl -sk -o /dev/null https://localhost:8443; then
+            echo "    MISP is up."
+            break
+          fi
+          echo "    Waiting... ($i/30)"
+          sleep 10
+        done
+
+        echo "==> Starting Shuffle..."
+        docker compose -f $SERVICES_PATH/shuffle/docker-compose.yml up -d
+
+        echo "==> Starting Prometheus..."
+        docker compose -f $SERVICES_PATH/prometheus/docker-compose.yml up -d
+
+        echo ""
+        echo "All stacks started. Run 'stackctl status' to verify."
+      }
+
+      stop_stacks() {
+        echo "==> Stopping Prometheus..."
+        docker compose -f $SERVICES_PATH/prometheus/docker-compose.yml down
+
+        echo "==> Stopping Shuffle..."
+        docker compose -f $SERVICES_PATH/shuffle/docker-compose.yml down
+
+        echo "==> Stopping MISP..."
+        docker compose -f $SERVICES_PATH/misp/docker-compose.yml down
+
+        echo "==> Stopping security-core (Graylog + Wazuh)..."
+        docker compose -f $SERVICES_PATH/security-core/docker-compose.yml down
+
+        echo ""
+        echo "All stacks stopped."
+      }
+
+      status_stacks() {
+        echo "=== security-core ==="
+        docker compose -f $SERVICES_PATH/security-core/docker-compose.yml ps
+
+        echo ""
+        echo "=== MISP ==="
+        docker compose -f $SERVICES_PATH/misp/docker-compose.yml ps
+
+        echo ""
+        echo "=== Shuffle ==="
+        docker compose -f $SERVICES_PATH/shuffle/docker-compose.yml ps
+
+        echo ""
+        echo "=== Prometheus ==="
+        docker compose -f $SERVICES_PATH/prometheus/docker-compose.yml ps
+      }
+
+      case "$1" in
+        start)   start_stacks ;;
+        stop)    stop_stacks ;;
+        restart) stop_stacks && start_stacks ;;
+        status)  status_stacks ;;
+        *)
+          echo "Usage: stackctl {start|stop|restart|status}"
+          exit 1
+          ;;
+      esac
+      {% endraw %}
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install dps script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/dps
+    content: |
+      {% raw %}#!/bin/bash
+      # dps — pretty docker ps with color-coded status
+      echo ""
+      printf "%-40s %-30s %s\n" "CONTAINER" "STATUS" "PORTS"
+      printf "%-40s %-30s %s\n" "---------" "------" "-----"
+      docker ps --format "{{.Names}}\t{{.Status}}\t{{.Ports}}" | while IFS=$'\t' read -r name status ports; do
+        if echo "$status" | grep -q "healthy"; then
+          color="\033[32m"
+        elif echo "$status" | grep -q "health: starting"; then
+          color="\033[33m"
+        elif echo "$status" | grep -q "Restarting\|unhealthy"; then
+          color="\033[31m"
+        else
+          color="\033[36m"
+        fi
+        printf "${color}%-40s %-30s %s\033[0m\n" "$name" "$status" "$ports"
+      done
+      echo ""{% endraw %}
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install SecMonDock shell helpers
+  ansible.builtin.copy:
+    dest: /etc/profile.d/secmondock.sh
+    content: |
+      {% raw %}# SecMonDock shell helpers
+
+      cdstack() {
+        case "$1" in
+          security-core|sc) cd /opt/services/secmondock/security-core ;;
+          misp)             cd /opt/services/secmondock/misp ;;
+          shuffle)          cd /opt/services/secmondock/shuffle ;;
+          prometheus)       cd /opt/services/secmondock/prometheus ;;
+          data)             cd /mnt/data ;;
+          *)
+            echo "Usage: cdstack {security-core|sc|misp|shuffle|prometheus|data}"
+            ;;
+        esac
+      }
+
+      dlogs() {
+        if [ -z "$1" ]; then
+          echo "Usage: dlogs <container-name> [lines]"
+          return 1
+        fi
+        docker logs "$1" 2>&1 | tail -"${2:-50}"
+      }
+
+      dexec() {
+        if [ -z "$1" ]; then
+          echo "Usage: dexec <container-name>"
+          return 1
+        fi
+        docker exec -it "$1" /bin/bash 2>/dev/null || docker exec -it "$1" /bin/sh
+      }{% endraw %}
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install checklogs script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/checklogs
+    content: |
+      {% raw %}#!/bin/bash
+      for container in $(docker ps --format "{{.Names}}"); do
+        echo "=== $container ==="
+        docker logs $container 2>&1 | grep -i "error\|fatal\|failed" | tail -5
+        echo ""
+      done{% endraw %}
+    owner: root
+    group: root
+    mode: '0755'

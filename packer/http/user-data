@@ -1,0 +1,61 @@
+#cloud-config
+# ============================================================
+# WHAT IS THIS FILE?
+# Ubuntu autoinstall configuration — runs during the OS install
+# before Packer's SSH provisioners ever connect.
+#
+# Values marked __PLACEHOLDER__ are substituted by the workflow's
+# "Inject variables into user-data" step before Packer runs.
+# This file should never contain hardcoded IPs or keys.
+#
+# KEY ROTATION: If you regenerate packer_rsa, update PACKER_SSH_PUBLIC_KEY
+# in Forgejo variables. The comment "packer-build" at the end of the key
+# must be preserved — the cleanup provisioner in ubuntu.pkr.hcl uses it
+# to find and remove this entry before the template is finalized.
+# ============================================================
+autoinstall:
+  version: 1
+
+  locale: en_US
+
+  keyboard:
+    layout: us
+
+  apt:
+    geoip: false
+    preserve_sources_list: false
+
+  network:
+    version: 2
+    ethernets:
+      ens18:
+        addresses:
+          - __BUILD_VM_IP__/24
+        gateway4: __GATEWAY__
+        nameservers:
+          addresses:
+            - __DNS_SERVER_1__
+            - __DNS_SERVER_2__
+            - 8.8.8.8
+
+  identity:
+    hostname: ubuntu-template
+    username: ubuntu
+    password: "$6$DvK/yVxZ7WkOFoRZ$3nF5kmSQdBmx60FKrARnxlRPMtpzzEWMiH4Fxv9gSeQ1fsqgYANVfChiLtvyjsun2Cx3iRYchC0EtswniFq1k."
+
+  ssh:
+    install-server: true
+    allow-pw: false
+
+  late-commands:
+    - mkdir -p /target/home/ubuntu/.ssh
+    - 'echo "__PACKER_SSH_PUBLIC_KEY__" > /target/home/ubuntu/.ssh/authorized_keys'
+    - chmod 700 /target/home/ubuntu/.ssh
+    - chmod 600 /target/home/ubuntu/.ssh/authorized_keys
+    - chown -R 1000:1000 /target/home/ubuntu/.ssh
+    - 'echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /target/etc/sudoers.d/ubuntu'
+    - chmod 440 /target/etc/sudoers.d/ubuntu
+
+  storage:
+    layout:
+      name: direct

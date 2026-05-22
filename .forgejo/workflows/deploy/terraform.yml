@@ -1,0 +1,159 @@
+# Provisions VMs with Terraform. Runs when terraform/vms/ or terraform/modules/ changes,
+# or when triggered manually. After apply, VM info is written to MinIO so Ansible
+# can consume it independently.
+#
+# Required Forgejo secrets (Settings → Secrets):
+#   PROXMOX_API_TOKEN      Combined token string (tokenid=secret)
+#   MINIO_ACCESS_KEY       MinIO access key
+#   MINIO_SECRET_KEY       MinIO secret key
+#
+# Required Forgejo variables (Settings → Variables):
+#   PROXMOX_URL            Proxmox API endpoint (e.g. https://<proxmox-host>:8006/)
+#   TEMPLATE_VM_ID         VM ID of the Packer Ubuntu template
+#   MINIO_ENDPOINT         MinIO endpoint (e.g. http://<minio-host>:9000)
+#   MINIO_BUCKET           MinIO bucket name
+
+# only if someone pushes to those main paths
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/vms/**'
+      - 'terraform/modules/**'   # module changes affect all root modules that use them
+
+  workflow_call:  # this is for the big workflow (it breaks without it)
+    inputs:
+      destroy_first:
+        type: boolean
+        default: false
+      destroy_all:
+        type: boolean
+        default: false
+
+
+  workflow_dispatch:  # triggers that dictate how this workflow runs
+    inputs:
+      destroy_first:
+        description: "Destroy existing VMs first (full reset)"
+        required: false
+        default: 'false'
+        type: boolean
+      destroy_all:
+        description: "Destroy everything (do NOT recreate)"
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  terraform:
+    runs-on: chirplabs  # tells which runner label to run on
+    timeout-minutes: 60 # if job hasn't complete in 60 minutes - quit
+    steps:
+
+      # downloads the repo code onto the runner
+      - name: Checkout repo   
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git init
+          git remote add origin ${{ github.server_url }}/${{ github.repository }}
+          git fetch --depth=1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD
+
+      # connects to the MinIO S3 storage and initializes the terraform plugin for proxmox as well as the working directory
+      - name: Terraform Init
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          TF_PLUGIN_CACHE_DIR:   /opt/terraform-plugin-cache
+        run: terraform init -lock-timeout=60s
+
+      # makes sure all the logic in the repo is sound and doesn't have errors - is amazing for catching things early
+      - name: Terraform Validate
+        working-directory: terraform/vms
+        run: terraform validate
+
+
+      # writes the proxmox token to a temp file - this is for the persistent disk attaching
+      - name: Write Proxmox token for destroy provisioner
+        run: |
+          printf "%s" "${{ secrets.PROXMOX_API_TOKEN }}" > /tmp/proxmox_token
+          chmod 600 /tmp/proxmox_token
+
+          
+
+      # destroys all the vms and updates status in MinIO
+      - name: Terraform Destroy (if requested)
+        if: ${{ inputs.destroy_first == true || inputs.destroy_all == true }}
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:        ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:    ${{ secrets.MINIO_SECRET_KEY }}
+          TF_VAR_proxmox_api_token: ${{ secrets.PROXMOX_API_TOKEN }}
+          TF_PLUGIN_CACHE_DIR:      /opt/terraform-plugin-cache
+        run: terraform destroy -auto-approve
+
+      # compares .tf files against the current state and what exists in proxmox
+      - name: Terraform Plan
+        if: ${{ inputs.destroy_all != true }}
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:        ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:    ${{ secrets.MINIO_SECRET_KEY }}
+          TF_VAR_proxmox_api_token: ${{ secrets.PROXMOX_API_TOKEN }}
+          TF_PLUGIN_CACHE_DIR:      /opt/terraform-plugin-cache
+        run: terraform plan -out=tfplan   # creates a plan called "tfplan" to be used in terraform apply
+          
+      # applies changes that were from the terraform plan
+      - name: Terraform Apply
+        if: ${{ inputs.destroy_all != true }}
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:        ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:    ${{ secrets.MINIO_SECRET_KEY }}
+          TF_VAR_proxmox_api_token: ${{ secrets.PROXMOX_API_TOKEN }}
+          TF_PLUGIN_CACHE_DIR:      /opt/terraform-plugin-cache
+        run: terraform apply -parallelism=1 -lock-timeout=60s tfplan   # tfplan is now executed
+                            # keep parallelism=1 so then it doesn't overload the systems (only 1 created/changed at a time)
+
+      # exports a json that contains whatever specified in ansible-outputs.tf 
+      - name: Export VM info to MinIO
+        if: ${{ inputs.destroy_all != true }}
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          TF_PLUGIN_CACHE_DIR:   /opt/terraform-plugin-cache
+          MINIO_ENDPOINT:        ${{ vars.MINIO_ENDPOINT }}
+          MINIO_BUCKET:          ${{ vars.MINIO_BUCKET }}
+        run: |
+          terraform output -json vm_ips > vm_info.json
+          curl -s -k \
+            --aws-sigv4 "aws:amz:local:s3" \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+            -T vm_info.json \
+            "$MINIO_ENDPOINT/$MINIO_BUCKET/vm_info.json"
+
+
+      # was mainly used for faily on sandbox nodes, but if terraform fails in creating vms
+      # it sometimes locks the vms indefintely and this unlocks them
+      - name: Force unlock state if locked
+        if: failure()
+        working-directory: terraform/vms
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          TF_PLUGIN_CACHE_DIR:   /opt/terraform-plugin-cache
+        run: |
+          LOCK_ID=$(terraform force-unlock -force 2>&1 | grep -oE '[a-f0-9-]{36}' | head -1) || true
+          if [ -n "$LOCK_ID" ]; then
+            terraform force-unlock -force $LOCK_ID
+            echo "Unlocked state: $LOCK_ID"
+          else
+            echo "No lock found"
+          fi
+          
+      - name: Cleanup sensitive files
+        if: always()
+        run: rm -f /tmp/proxmox_token

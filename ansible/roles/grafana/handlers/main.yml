@@ -1,0 +1,11 @@
+# =============================================================================
+# FILE: roles/grafana/handlers/main.yml
+# PURPOSE: Handlers for the Grafana role. Handlers only run when notified
+#          by a task — they run once at the end of the play, not immediately.
+#          This means Grafana only restarts if something actually changed.
+# =============================================================================
+
+- name: Restart grafana
+  ansible.builtin.systemd:
+    name: grafana-server
+    state: restarted

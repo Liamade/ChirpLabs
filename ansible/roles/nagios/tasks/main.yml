@@ -1,0 +1,336 @@
+# Installs and configures Nagios on the Nagios VM.
+# Nagios was compiled from source on the original VM — this role restores
+# the compiled install by mounting the persistent disk directly at
+# /usr/local/nagios/ so the application reads and writes there natively.
+# Config changes persist automatically without any manual backup step.
+# Also installs Apache, NRPE, and the Prometheus Nagios exporter.
+# Safe to run on both fresh VMs and rebuilds — idempotent.
+
+# Install Nagios runtime and build dependencies.
+# Build deps are required even though we aren't recompiling — the source-built
+# binaries link against gcc libs at runtime.
+- name: Install Nagios runtime dependencies
+  ansible.builtin.apt:
+    name:
+      - apache2
+      - libapache2-mod-php
+      - php
+      - php-xml
+      - nagios-nrpe-server
+      - monitoring-plugins
+      - openssl
+      - unzip
+      - wget
+    state: present
+    update_cache: true
+
+- name: Install Nagios build dependencies
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - gcc
+      - make
+      - libssl-dev
+      - libgd-dev
+    state: present
+    update_cache: false
+
+# Create the nagios user and groups before mounting the disk so
+# ownership can be set correctly in the next section.
+- name: Create nagcmd group
+  ansible.builtin.group:
+    name: nagcmd
+    state: present
+
+- name: Create nagios group
+  ansible.builtin.group:
+    name: nagios
+    state: present
+
+- name: Create nagios user
+  ansible.builtin.user:
+    name: nagios
+    groups: nagios,nagcmd
+    shell: /bin/false
+    system: true
+    state: present
+
+- name: Add www-data to nagcmd group
+  ansible.builtin.user:
+    name: www-data   # Apache runs as www-data — needs nagcmd to submit web UI commands
+    groups: nagcmd
+    append: true
+    state: present
+
+# Find the persistent data disk by UUID rather than device name.
+# Device names (/dev/sdb, /dev/sdc) shift depending on attach order.
+# UUIDs are stable across reboots and rebuilds.
+- name: Find data disk device by UUID
+  ansible.builtin.shell: blkid -U {{ nagios_disk_uuid }}
+  register: data_disk_found
+  changed_when: false
+  failed_when: false
+
+- name: Reboot if data disk not detected
+  ansible.builtin.reboot:
+    reboot_timeout: 120
+  when: data_disk_found.stdout == ""
+
+- name: Re-detect data disk after reboot
+  ansible.builtin.shell: blkid -U {{ nagios_disk_uuid }}
+  register: data_disk_after_reboot
+  changed_when: false
+  when: data_disk_found.stdout == ""
+
+- name: Set data disk device variable
+  ansible.builtin.set_fact:
+    data_disk_device: >-
+      {{ data_disk_after_reboot.stdout
+         if (data_disk_found.stdout == '' and data_disk_after_reboot is not skipped)
+         else data_disk_found.stdout }}
+
+- name: Check for existing filesystem on data disk
+  ansible.builtin.command: blkid -o value -s TYPE {{ data_disk_device }}
+  register: disk_fs
+  changed_when: false
+  failed_when: false
+
+- name: Check if disk is already mounted
+  ansible.builtin.command: mountpoint -q {{ nagios_data_path }}
+  register: already_mounted
+  changed_when: false
+  failed_when: false
+
+- name: Format data disk as ext4 (first run only — skipped on rebuilds)
+  ansible.builtin.filesystem:
+    fstype: ext4
+    dev: "{{ data_disk_device }}"
+  when: disk_fs.stdout == ""
+
+- name: Create /usr/local/nagios mount point if it does not exist
+  ansible.builtin.file:
+    path: "{{ nagios_data_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Mount persistent disk directly at /usr/local/nagios
+  ansible.builtin.mount:
+    path: "{{ nagios_data_path }}"
+    src: "UUID={{ nagios_disk_uuid }}"
+    fstype: ext4
+    opts: defaults
+    state: mounted   # mounts now AND writes to /etc/fstab for persistence on reboot
+
+- name: Create systemd override directory for Nagios service
+  ansible.builtin.file:
+    path: /etc/systemd/system/nagios.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Ensure Nagios waits for data disk mount
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nagios.service.d/mount-order.conf
+    content: |
+      [Unit]
+      After=usr-local-nagios.mount
+      Requires=usr-local-nagios.mount
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart nagios
+
+# After mounting, disk files may be owned by a different UID from a previous VM.
+# Fix ownership so the nagios user can access everything.
+- name: Set ownership on Nagios install directory
+  ansible.builtin.file:
+    path: "{{ nagios_data_path }}"
+    owner: nagios
+    group: nagios
+    recurse: true
+
+- name: Set nagcmd group on var/rw directory
+  ansible.builtin.file:
+    path: "{{ nagios_data_path }}/var/rw"
+    owner: nagios
+    group: nagcmd
+    mode: '0770'
+    state: directory
+
+# Restore configs that live outside /usr/local/nagios/ from their
+# backup location on the persistent disk. These are backed up with
+# the `backuptodisk` script (installed below).
+- name: Restore NRPE config from data disk
+  ansible.builtin.copy:
+    src: "{{ nagios_config_backup_path }}/etc-nagios/"
+    dest: /etc/nagios/
+    owner: root
+    group: root
+    mode: preserve
+    remote_src: true
+
+- name: Restore Apache Nagios site config from data disk
+  ansible.builtin.copy:
+    src: "{{ nagios_config_backup_path }}/nagios-apache.conf"
+    dest: /etc/apache2/sites-available/nagios.conf
+    owner: root
+    group: root
+    mode: '0644'
+    remote_src: true
+
+# The nagios.service file is static and never changes, so it belongs
+# in code rather than on the persistent disk.
+- name: Create Nagios systemd service file
+  ansible.builtin.copy:
+    dest: /lib/systemd/system/nagios.service
+    content: |
+      [Unit]
+      Description=Nagios Core 4.5.11
+      Documentation=https://www.nagios.org/documentation
+      After=network.target local-fs.target
+
+      [Service]
+      Type=forking
+      ExecStartPre=/usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+      ExecStart=/usr/local/nagios/bin/nagios -d /usr/local/nagios/etc/nagios.cfg
+      ExecStop=/usr/bin/kill -s TERM ${MAINPID}
+      ExecStopPost=/usr/bin/rm -f /usr/local/nagios/var/rw/nagios.cmd
+      ExecReload=/usr/local/nagios/bin/nagios -v /usr/local/nagios/etc/nagios.cfg
+      ExecReload=/usr/bin/kill -s HUP ${MAINPID}
+
+      [Install]
+      WantedBy=multi-user.target
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd to pick up Nagios service file
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# Enable Apache modules and the Nagios site.
+# SSLRequireSSL blocks HTTP access — comment it out since we're running internally.
+- name: Enable Apache CGI module
+  ansible.builtin.command: a2enmod cgi
+  changed_when: false
+  notify: Restart apache
+
+- name: Enable Apache rewrite module
+  ansible.builtin.command: a2enmod rewrite
+  changed_when: false
+  notify: Restart apache
+
+- name: Enable Nagios Apache site
+  ansible.builtin.command: a2ensite nagios
+  changed_when: false
+  notify: Restart apache
+
+- name: Disable SSLRequireSSL in Nagios Apache config
+  ansible.builtin.replace:
+    path: /etc/apache2/sites-available/nagios.conf
+    regexp: '^\s*SSLRequireSSL'
+    replace: '# SSLRequireSSL'
+  notify: Restart apache
+
+- name: Enable and start Apache
+  ansible.builtin.systemd:
+    name: apache2
+    enabled: true
+    state: started
+
+# Prometheus Nagios exporter isn't in apt — install from the GitHub release deb.
+# Exposes Nagios metrics on port 9927 for Prometheus scraping.
+- name: Download Prometheus Nagios exporter deb package
+  ansible.builtin.get_url:
+    url: "https://github.com/linode-obs/nagios_exporter/releases/download/v1.2.5/prometheus-nagios-exporter_1.2.5_linux_amd64.deb"
+    dest: /tmp/prometheus-nagios-exporter.deb
+    mode: '0644'
+
+- name: Install Prometheus Nagios exporter from deb package
+  ansible.builtin.apt:
+    deb: /tmp/prometheus-nagios-exporter.deb
+    state: present
+
+- name: Configure Prometheus Nagios exporter environment file
+  ansible.builtin.copy:
+    dest: /etc/default/prometheus-nagios-exporter
+    content: |
+      # Prometheus Nagios Exporter default arguments
+      # Managed by Ansible — do not edit manually, update the role instead
+      ARGS="--nagios.stats_binary=/usr/local/nagios/bin/nagiostats --nagios.config_path=/usr/local/nagios/etc/nagios.cfg"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart prometheus-nagios-exporter
+
+- name: Reload systemd to pick up Prometheus Nagios exporter service
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start Prometheus Nagios exporter
+  ansible.builtin.systemd:
+    name: prometheus-nagios-exporter
+    enabled: true
+    state: started
+
+- name: Enable and start Nagios
+  ansible.builtin.systemd:
+    name: nagios
+    enabled: true
+    state: started
+
+- name: Enable and start NRPE
+  ansible.builtin.systemd:
+    name: nagios-nrpe-server
+    enabled: true
+    state: started
+
+# Verify all services came up — fail loudly if something didn't start
+# so it's obvious immediately rather than silently leaving a broken VM.
+- name: Verify Nagios is running
+  ansible.builtin.systemd:
+    name: nagios
+  register: nagios_status
+  failed_when: nagios_status.status.ActiveState != "active"
+
+- name: Verify Apache is running
+  ansible.builtin.systemd:
+    name: apache2
+  register: apache_status
+  failed_when: apache_status.status.ActiveState != "active"
+
+- name: Verify NRPE is running
+  ansible.builtin.systemd:
+    name: nagios-nrpe-server
+  register: nrpe_status
+  failed_when: nrpe_status.status.ActiveState != "active"
+
+# Install a helper script to back up external configs to the persistent disk.
+# Run `sudo backuptodisk` after making manual config changes so they survive
+# the next VM rebuild.
+- name: Install Nagios backup script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/backuptodisk
+    content: |
+      #!/bin/bash
+      echo "Syncing Nagios external configs to persistent disk..."
+      rsync -a /etc/nagios/ {{ nagios_config_backup_path }}/etc-nagios/
+      cp /etc/apache2/sites-available/nagios.conf {{ nagios_config_backup_path }}/nagios-apache.conf
+      cp /etc/default/prometheus-nagios-exporter {{ nagios_config_backup_path }}/prometheus-nagios-exporter.env
+      echo "Done. Changes will survive the next VM rebuild. :)"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Restart Nagios to ensure clean startup
+  ansible.builtin.systemd:
+    name: nagios
+    state: restarted
+
+- name: Restart Apache to ensure it picks up all config
+  ansible.builtin.systemd:
+    name: apache2
+    state: restarted

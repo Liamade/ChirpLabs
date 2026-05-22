@@ -1,0 +1,11 @@
+---
+# Variables for all hosts in the [grafana] inventory group.
+
+# Disk
+grafana_disk_uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # UUID of vm-999-Grafana-DATA (run `blkid` on the VM to find yours)
+grafana_data_path: /var/lib/grafana   # mount point — Grafana's main data directory
+grafana_config_path: /etc/grafana
+
+# Credentials — empty default, injected at runtime via -e from Forgejo secrets
+grafana_admin_user: "ctadmin"
+grafana_admin_password: ""

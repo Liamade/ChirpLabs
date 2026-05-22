@@ -1,0 +1,16 @@
+# ============================================================
+# WHAT IS THIS FILE?
+# This is the cloud-init "meta-data" file. It's a companion to user-data.
+# Cloud-init requires BOTH files to exist — even if meta-data is mostly empty.
+# If this file is missing, the Ubuntu installer will hang waiting for it.
+#
+# In a real cloud environment (AWS, GCP, etc.) meta-data would contain
+# things like the instance ID assigned by the cloud provider.
+# For a local Packer build, we just need it to exist with a valid instance-id.
+# ============================================================
+
+instance-id: ubuntu-template     # A unique identifier for this instance.
+                                  # Can be any string — just needs to be present.
+                                  # Cloud-init uses this to detect if it's already run.
+local-hostname: ubuntu-template  # Hostname hint for cloud-init during first boot.
+                                  # Cloned VMs will override this via Proxmox's cloud-init settings.

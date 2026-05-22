@@ -1,0 +1,96 @@
+# =============================================================================
+# FILE: .forgejo/workflows/deploy-all.yml
+# PURPOSE: Master workflow that runs Packer → Terraform → Ansible in order.
+#          Each stage only runs if the previous one succeeded — if Packer
+#          fails, Terraform and Ansible won't run. If Terraform fails,
+#          Ansible won't run.
+#
+#          Use this for a full end-to-end rebuild from scratch.
+#          Each individual workflow (packer.yml, terraform.yml, ansible.yml)
+#          can still be triggered independently as normal — this just
+#          orchestrates all three in sequence.
+#
+# TRIGGER:
+#   Manual only (workflow_dispatch) — this is a destructive operation
+#   that rebuilds everything. Not something you want running on every push.
+#
+# INPUTS:
+#   force_rebuild_packer  → passed to packer.yml  — force rebuild templates
+#                           even if they already exist
+#   destroy_first         → passed to terraform.yml — destroy existing VMs
+#                           before recreating them (full reset)
+#   destroy_all           → passed to terraform.yml — destroy everything
+#                           and do NOT recreate (tear down only)
+#
+# NOTE ON secrets: inherit
+#   Each called workflow receives all Forgejo secrets automatically.
+#   You do not need to re-declare secrets here.
+# =============================================================================
+
+name: Deploy All
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebuild_packer:
+        description: "Force rebuild Packer templates even if they already exist"
+        required: false
+        default: false
+        type: boolean
+      destroy_first:
+        description: "Destroy existing VMs before recreating (full Terraform reset)"
+        required: false
+        default: false
+        type: boolean
+      destroy_all:
+        description: "Destroy everything and do NOT recreate (tear down only)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+
+  # ── STAGE 1: PACKER ─────────────────────────────────────────────────────────
+  # Builds the golden VM templates on Amy and Farnsworth.
+  # Skipped automatically if templates already exist and force_rebuild is false.
+  # Both nodes are built sequentially (max-parallel: 1 in packer.yml).
+  packer:
+    name: PACKER -- Build Golden Image
+    uses: ./.forgejo/workflows/deploy/packer.yml
+    secrets: inherit
+    with:
+      force_rebuild: ${{ inputs.force_rebuild_packer }}
+
+  # ── STAGE 2: TERRAFORM ──────────────────────────────────────────────────────
+  # Provisions VMs by cloning the templates built in Stage 1.
+  # Only runs if Packer succeeded.
+  # After apply, exports vm_info.json to MinIO for Ansible to consume.
+  terraform:
+    name: TERRAFORM -- Provision VMs
+    needs: packer          # only runs if packer job succeeded
+    uses: ./.forgejo/workflows/deploy/terraform.yml
+    secrets: inherit
+    with:
+      destroy_first: ${{ inputs.destroy_first }}
+      destroy_all: ${{ inputs.destroy_all }}
+  
+  # sometimes the vm needs some time to adjust to the changes
+  wait:
+    name: Wait for VMs to finish booting
+    needs: terraform
+    runs-on: chirplabs
+    steps:
+      - name: Wait for cloud-init to complete
+        run: |
+          echo "Waiting 60 seconds for VMs to finish booting..."
+          sleep 60
+  # ── STAGE 3: ANSIBLE ────────────────────────────────────────────────────────
+  # Configures all provisioned VMs by reading vm_info.json from MinIO.
+  # Only runs if Terraform succeeded and destroy_all was not requested
+  # (no point configuring VMs that were just destroyed).
+  ansible:
+    name: ANSIBLE -- Configure VMs
+    needs: terraform       # only runs if terraform job succeeded
+    if: ${{ !inputs.destroy_all }}
+    uses: ./.forgejo/workflows/deploy/ansible.yml
+    secrets: inherit

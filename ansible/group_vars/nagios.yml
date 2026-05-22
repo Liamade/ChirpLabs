@@ -1,0 +1,8 @@
+---
+# Variables for all hosts in the [nagios] inventory group.
+
+# Disk
+nagios_data_path: /usr/local/nagios      # mount point — the full Nagios install root
+nagios_disk_uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # UUID of vm-999-Nagios-DATA (run `blkid` on the VM to find yours)
+
+nagios_config_backup_path: /usr/local/nagios/disk-backups

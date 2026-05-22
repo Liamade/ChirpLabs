@@ -1,0 +1,24 @@
+strict.perms: false
+
+filebeat.inputs:
+  - type: filestream
+    id: wazuh-alerts
+    enabled: true
+    paths:
+      - /var/ossec/logs/alerts/alerts.json
+    parsers:
+      - ndjson:
+          overwrite_keys: true
+          add_error_key: true
+
+# IMPORTANT: Disable Elasticsearch output
+output.elasticsearch:
+  enabled: false
+
+# Send to Graylog Beats input
+output.logstash:
+  hosts: ["graylog:5044"]
+
+logging.to_files: true
+logging.to_stderr: true
+logging.level: info

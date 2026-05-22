@@ -1,0 +1,12 @@
+# =============================================================================
+# FILE: playbooks/secmondock.yml
+# PURPOSE: Playbook for the SecMonDock VM.
+#          Handles disk mounting, Docker setup, and all security monitoring
+#          stacks (Graylog, Wazuh, MISP, Shuffle, Prometheus).
+# =============================================================================
+---
+- name: Configure SecMonDock VM
+  hosts: secmondock
+  become: true
+  roles:
+    - secmondock

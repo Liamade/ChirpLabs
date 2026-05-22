@@ -1,0 +1,3 @@
+# hosts.ini is generated at runtime by generate_inventory.py
+# It is never committed to the repo
+hosts.ini

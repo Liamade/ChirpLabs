@@ -1,0 +1,25 @@
+---
+# Variables for all hosts in the [secmondock] inventory group.
+#
+# Secrets (injected at runtime via -e from Forgejo secrets):
+#   wazuh_api_password          — Wazuh API password
+#   wazuh_indexer_password      — Wazuh indexer password
+#   wazuh_dashboard_password    — Wazuh dashboard password
+#   graylog_password_secret     — Graylog password secret
+#   graylog_root_password_sha2  — SHA256 hash of Graylog root password
+#   shuffle_opensearch_password — Shuffle OpenSearch password
+
+# Disk
+secmondock_data_path: /mnt/data
+secmondock_disk_uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # UUID of vm-999-SecMonDock-DATA (run `blkid` on the VM to find yours)
+
+# Service directories
+secmondock_services_path: /opt/services/secmondock  # where compose files and role assets are deployed
+
+# Secrets — empty defaults, always overridden by -e at runtime
+wazuh_api_password: ""
+wazuh_indexer_password: ""
+wazuh_dashboard_password: ""
+graylog_password_secret: ""
+graylog_root_password_sha2: ""
+shuffle_opensearch_password: ""

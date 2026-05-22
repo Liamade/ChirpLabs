@@ -1,0 +1,219 @@
+# Builds the golden VM template with Packer whenever something in packer/ changes.
+#
+# Builds run sequentially on both Proxmox nodes via a matrix strategy. Each node
+# gets its own independent template on its own local storage. Terraform clones
+# locally on each node — no cross-node transfer needed.
+#
+# Required Forgejo secrets (Settings → Secrets):
+#   PROXMOX_TOKEN_ID       API token ID  (e.g. forgejo@pam!forgejo)
+#   PROXMOX_TOKEN_SECRET   API token secret UUID
+#   PACKER_SSH_PRIVATE_KEY Private half of the packer_ed25519 keypair
+#
+# Required Forgejo variables (Settings → Variables):
+#   PACKER_VM_IP_AMY           Static IP for Amy's temporary build VM
+#   PACKER_VM_IP_FARNSWORTH    Static IP for Farnsworth's temporary build VM
+#   PACKER_GATEWAY             Gateway for the temporary build VM
+#   PACKER_SSH_PUBLIC_KEY      Public half of packer_ed25519
+#   ANSIBLE_SSH_PUBLIC_KEY     Public half of ansible_ed25519
+#   TEMPLATE_STORAGE_POOL      NFS pool name where the Ubuntu ISO lives
+#   PACKER_ISO_FILE            Full ISO path (e.g. "pool:iso/ubuntu-24.04-live-server-amd64.iso")
+#   PACKER_ISO_CHECKSUM        ISO checksum (e.g. "sha256:abc123...")
+#   PACKER_VLAN_ID             VLAN tag for the build VM NIC
+#
+# Node-specific config (set proxmox_host and proxmox_url to match your environment):
+#   Amy:        proxmox_host = <node-1-ip>:8006   template_vm_id = 299
+#   Farnsworth: proxmox_host = <node-2-ip>:8006   template_vm_id = 298
+#
+# SSH keypair separation:
+#   packer_ed25519  — used ONLY during this build so Packer can SSH into the build VM.
+#                     Injected via user-data, removed from the template in the cleanup step.
+#                     Never reaches production.
+#   ansible_ed25519 — baked into the template so Ansible can SSH into every deployed VM.
+#                     This key persists into production.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'packer/**'
+
+  workflow_call:
+    inputs:
+      force_rebuild:
+        type: boolean
+        default: false
+
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild template even if it already exists"
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  packer:
+    runs-on: chirplabs
+
+    # Build Amy first, then Farnsworth. Sequential (max-parallel: 1) so both
+    # builds don't compete for the same build VM IP or runner resources.
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - node: Amy
+            proxmox_host: "<proxmox-node-1-ip>:8006"
+            proxmox_url: "https://<proxmox-node-1-ip>:8006/api2/json"
+            template_vm_id: "299"
+            disk_storage: "data"
+            disk_format: "raw"
+            build_vm_ip: ${{ vars.PACKER_VM_IP_AMY }}
+            build_bridge: "vmbr0"
+            build_vlan_tag: "81"
+
+          - node: Farnsworth
+            proxmox_host: "<proxmox-node-2-ip>:8006"
+            proxmox_url: "https://<proxmox-node-2-ip>:8006/api2/json"
+            template_vm_id: "298"
+            disk_storage: "data"
+            disk_format: "raw"
+            build_vm_ip: ${{ vars.PACKER_VM_IP_FARNSWORTH }}
+            build_bridge: "vlan81"
+            build_vlan_tag: ""
+
+    steps:
+      - name: Checkout repo
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git init
+          git remote add origin ${{ github.server_url }}/${{ github.repository }}
+          git fetch --depth=1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD
+
+      # Substitute Forgejo variables into user-data before Packer uploads it
+      # as the cidata ISO. user-data is a static file and isn't processed by
+      # Packer, so values must be injected here before the build runs.
+      - name: Inject variables into user-data
+        run: |
+          sed -i \
+            -e "s|__BUILD_VM_IP__|${{ matrix.build_vm_ip }}|g" \
+            -e "s|__GATEWAY__|${{ vars.PACKER_GATEWAY }}|g" \
+            -e "s|__PACKER_SSH_PUBLIC_KEY__|${{ vars.PACKER_SSH_PUBLIC_KEY }}|g" \
+            -e "s|__DNS_SERVER_1__|${{ vars.DNS_SERVER_1 }}|g" \
+            -e "s|__DNS_SERVER_2__|${{ vars.DNS_SERVER_2 }}|g" \
+            packer/http/user-data
+
+      - name: Debug user-data after injection
+        run: |
+          grep "addresses\|gateway" packer/http/user-data
+
+      # Query the Proxmox API to check if the template already exists.
+      # If it does and force_rebuild wasn't requested, the build step is skipped.
+      - name: Check if template already exists on ${{ matrix.node }}
+        id: check
+        env:
+          PROXMOX_HOST: ${{ matrix.proxmox_host }}
+          PROXMOX_TOKENID: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PROXMOX_TOKENSECRET: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PROXMOX_NODE: ${{ matrix.node }}
+          PACKER_TEMPLATE_ID: ${{ matrix.template_vm_id }}
+        run: |
+          RESPONSE=$(curl -s -k \
+            -H "Authorization: PVEAPIToken=$PROXMOX_TOKENID=$PROXMOX_TOKENSECRET" \
+            "https://$PROXMOX_HOST/api2/json/nodes/$PROXMOX_NODE/qemu")
+
+          if [ -z "$RESPONSE" ]; then
+            echo "ERROR: Empty response from Proxmox API at $PROXMOX_HOST"
+            exit 1
+          fi
+
+          EXISTS=$(echo "$RESPONSE" | python3 -c 'import json,sys,os; tid=os.environ.get("PACKER_TEMPLATE_ID","").strip(); data=json.load(sys.stdin); vms=data.get("data",[]); found=any(str(v["vmid"])==tid for v in vms); print("true" if found else "false")')
+
+          echo "exists=$EXISTS" >> $GITHUB_OUTPUT
+          echo "Template ${{ matrix.template_vm_id }} exists on ${{ matrix.node }}: $EXISTS"
+
+      - name: Set up Packer SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PACKER_SSH_PRIVATE_KEY }}" > ~/.ssh/packer_rsa
+          chmod 600 ~/.ssh/packer_rsa
+
+      - name: Destroy existing template on ${{ matrix.node }} (if force rebuild)
+        if: ${{ inputs.force_rebuild == true }}
+        env:
+          PROXMOX_HOST: ${{ matrix.proxmox_host }}
+          PROXMOX_TOKENID: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PROXMOX_TOKENSECRET: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PROXMOX_NODE: ${{ matrix.node }}
+          TEMPLATE_VM_ID: ${{ matrix.template_vm_id }}
+        run: |
+          curl -s -k -X DELETE \
+            -H "Authorization: PVEAPIToken=$PROXMOX_TOKENID=$PROXMOX_TOKENSECRET" \
+            "https://$PROXMOX_HOST/api2/json/nodes/$PROXMOX_NODE/qemu/$TEMPLATE_VM_ID?purge=1&destroy-unreferenced-disks=1" \
+            || true
+          sleep 5
+
+      - name: Clean up any leftover build VM from previous failed run
+        if: ${{ steps.check.outputs.exists == 'false' || inputs.force_rebuild == true }}
+        env:
+          PROXMOX_HOST: ${{ matrix.proxmox_host }}
+          PROXMOX_TOKENID: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PROXMOX_TOKENSECRET: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PROXMOX_NODE: ${{ matrix.node }}
+          TEMPLATE_VM_ID: ${{ matrix.template_vm_id }}
+        run: |
+          curl -s -k -X DELETE \
+            -H "Authorization: PVEAPIToken=$PROXMOX_TOKENID=$PROXMOX_TOKENSECRET" \
+            "https://$PROXMOX_HOST/api2/json/nodes/$PROXMOX_NODE/qemu/$TEMPLATE_VM_ID?purge=1&destroy-unreferenced-disks=1" \
+            || true
+          sleep 5
+
+      - name: Packer Init
+        working-directory: packer
+        run: packer init ubuntu.pkr.hcl
+
+      - name: Build golden image on ${{ matrix.node }}
+        if: ${{ steps.check.outputs.exists == 'false' || inputs.force_rebuild == true }}
+        working-directory: packer
+        env:
+          PKR_VAR_proxmox_url: ${{ matrix.proxmox_url }}
+          PKR_VAR_proxmox_node: ${{ matrix.node }}
+          PKR_VAR_proxmox_token_id: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PKR_VAR_proxmox_token_secret: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PKR_VAR_ansible_ssh_public_key: ${{ vars.ANSIBLE_SSH_PUBLIC_KEY }}
+          PKR_VAR_vm_id: ${{ matrix.template_vm_id }}
+          PKR_VAR_build_vm_ip: ${{ matrix.build_vm_ip }}
+          PKR_VAR_iso_storage_pool: ${{ vars.TEMPLATE_STORAGE_POOL }}
+          PKR_VAR_disk_storage_pool: ${{ matrix.disk_storage }}
+          PKR_VAR_disk_format: ${{ matrix.disk_format }}
+          PKR_VAR_iso_file: ${{ vars.PACKER_ISO_FILE }}
+          PKR_VAR_iso_checksum: ${{ vars.PACKER_ISO_CHECKSUM }}
+          PKR_VAR_build_bridge: ${{ matrix.build_bridge }}
+          PKR_VAR_build_vlan_tag: ${{ matrix.build_vlan_tag }}
+        run: |
+          packer build \
+            -on-error=abort \
+            ubuntu.pkr.hcl
+
+      # Remove the cidata IDE3 drive from the finished template.
+      # The cidata ISO is on local storage — leaving it attached would prevent
+      # Proxmox from cloning the template cleanly. Build-time only.
+      - name: Remove cidata drive from template on ${{ matrix.node }}
+        if: ${{ steps.check.outputs.exists == 'false' || inputs.force_rebuild == true }}
+        env:
+          PROXMOX_HOST: ${{ matrix.proxmox_host }}
+          PROXMOX_TOKENID: ${{ secrets.PROXMOX_TOKEN_ID }}
+          PROXMOX_TOKENSECRET: ${{ secrets.PROXMOX_TOKEN_SECRET }}
+          PROXMOX_NODE: ${{ matrix.node }}
+          TEMPLATE_VM_ID: ${{ matrix.template_vm_id }}
+        run: |
+          curl -s -k -X PUT \
+            -H "Authorization: PVEAPIToken=$PROXMOX_TOKENID=$PROXMOX_TOKENSECRET" \
+            -d "delete=ide3" \
+            "https://$PROXMOX_HOST/api2/json/nodes/$PROXMOX_NODE/qemu/$TEMPLATE_VM_ID/config"
+
+      # Always runs even if the build fails — never leave the private key on the runner
+      - name: Clean up Packer SSH key
+        if: always()
+        run: rm -f ~/.ssh/packer_rsa

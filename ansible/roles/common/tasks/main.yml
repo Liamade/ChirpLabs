@@ -1,0 +1,67 @@
+# =============================================================================
+# FILE: roles/common/tasks/main.yml
+# PURPOSE: Common configuration applied to every Ubuntu/Debian VM in the
+#          pipeline. Runs before any service-specific roles.
+#          Safe to run on every VM on every pipeline run — idempotent.
+#
+# VARIABLES (from group_vars/all.yml):
+#   ctadmin_user_password  — Linux password for the linux user
+#                           injected at runtime from Forgejo secret
+# =============================================================================
+
+
+- name: Wait for apt lock to be released  # won't work without this
+  ansible.builtin.shell: |
+    while fuser /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock > /dev/null 2>&1; do
+      echo "Waiting for apt lock..."
+      sleep 5
+    done
+  changed_when: false
+  timeout: 300
+
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - git
+      - wget
+      - vim
+      - htop
+      - unzip
+      - net-tools
+      - dnsutils
+    state: present
+    update_cache: true
+
+- name: Create ctadmin user
+  ansible.builtin.user:
+    name: ctadmin
+    shell: /bin/bash
+    groups: sudo
+    append: true
+    state: present
+
+- name: Set password for ctadmin user
+  ansible.builtin.user:
+    name: ctadmin
+    password: "{{ ctadmin_user_password | password_hash('sha512') }}"
+    update_password: always
+
+- name: Install qemu-guest-agent
+  ansible.builtin.apt:
+    name: qemu-guest-agent
+    state: present
+    update_cache: false
+
+- name: Enable and start qemu-guest-agent
+  ansible.builtin.systemd:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
+
+
+
+
+
+    

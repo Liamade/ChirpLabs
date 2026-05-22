@@ -1,0 +1,28 @@
+# =============================================================================
+# FILE: roles/nagios/handlers/main.yml
+# PURPOSE: Handlers for the Nagios role. Only run when notified by a task.
+#          Handlers run once at the end of the play, not immediately.
+# =============================================================================
+
+- name: Restart apache
+  ansible.builtin.systemd:
+    name: apache2
+    state: restarted
+
+- name: Restart nagios
+  ansible.builtin.systemd:
+    name: nagios
+    state: restarted
+
+- name: Restart prometheus-nagios-exporter
+  ansible.builtin.systemd:
+    name: prometheus-nagios-exporter
+    state: restarted
+
+
+
+
+
+
+
+    

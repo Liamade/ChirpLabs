@@ -1,0 +1,248 @@
+# =============================================================================
+# FILE: roles/grafana/tasks/main.yml
+# PURPOSE: Installs and configures Grafana on the Grafana VM.
+#          Handles first-time disk formatting, persistent disk mounting,
+#          config restoration from the data disk, and admin credentials.
+#          Safe to run on both fresh VMs and rebuilds — idempotent.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECTION 1: PREREQUISITES
+# -----------------------------------------------------------------------------
+
+- name: Install prerequisites for Grafana apt repo
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - curl
+      - software-properties-common
+    state: present
+    update_cache: true
+
+# -----------------------------------------------------------------------------
+# SECTION 2: GRAFANA INSTALLATION
+# Install BEFORE mounting so the grafana user/group exists before
+# we try to set ownership on the data directory.
+# -----------------------------------------------------------------------------
+
+- name: Add Grafana apt repo signing key
+  ansible.builtin.apt_key:
+    url: https://apt.grafana.com/gpg.key
+    state: present
+
+- name: Add Grafana apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://apt.grafana.com stable main"
+    state: present
+
+- name: Install Grafana
+  ansible.builtin.apt:
+    name: grafana
+    state: present
+    update_cache: true
+
+# -----------------------------------------------------------------------------
+# SECTION 3: STOP SERVICE BEFORE TOUCHING DATA
+# -----------------------------------------------------------------------------
+
+- name: Stop Grafana before mounting data disk
+  ansible.builtin.systemd:
+    name: grafana-server
+    state: stopped
+
+# -----------------------------------------------------------------------------
+# SECTION 4: FIND THE DATA DISK BY UUID
+# -----------------------------------------------------------------------------
+
+- name: Find data disk device by UUID
+  ansible.builtin.shell: blkid -U {{ grafana_disk_uuid }}
+  register: data_disk_found
+  changed_when: false
+  failed_when: false
+
+# -----------------------------------------------------------------------------
+# SECTION 5: REBOOT IF DISK NOT VISIBLE
+# -----------------------------------------------------------------------------
+
+- name: Reboot if data disk not detected
+  ansible.builtin.reboot:
+    reboot_timeout: 120
+  when: data_disk_found.stdout == ""
+
+- name: Apply all fstab mounts after reboot
+  ansible.builtin.command: mount -a
+  changed_when: false
+  when: data_disk_found.stdout == ""
+
+- name: Re-detect data disk after reboot
+  ansible.builtin.shell: blkid -U {{ grafana_disk_uuid }}
+  register: data_disk_after_reboot
+  changed_when: false
+  when: data_disk_found.stdout == ""
+
+# -----------------------------------------------------------------------------
+# SECTION 6: SET DISK DEVICE AS A VARIABLE
+# -----------------------------------------------------------------------------
+
+- name: Set data disk device variable
+  ansible.builtin.set_fact:
+    data_disk_device: >-
+      {{ data_disk_after_reboot.stdout
+         if (data_disk_found.stdout == '' and data_disk_after_reboot is not skipped)
+         else data_disk_found.stdout }}
+
+# -----------------------------------------------------------------------------
+# SECTION 7: FORMAT DISK IF NEW
+# Only formats if no filesystem exists AND disk is not already mounted.
+# Both conditions protect existing data on rebuilds.
+# -----------------------------------------------------------------------------
+
+- name: Check for existing filesystem on data disk
+  ansible.builtin.shell: blkid {{ data_disk_device }} | grep -c TYPE || true
+  register: disk_fs
+  changed_when: false
+  failed_when: false
+
+- name: Check if disk is already mounted
+  ansible.builtin.command: mountpoint -q {{ grafana_data_path }}
+  register: already_mounted
+  changed_when: false
+  failed_when: false
+
+- name: Format data disk as ext4 (first run only — skipped on rebuilds)
+  ansible.builtin.filesystem:
+    fstype: ext4
+    dev: "{{ data_disk_device }}"
+  when:
+    - disk_fs.stdout == ""
+    - already_mounted.rc != 0
+
+# -----------------------------------------------------------------------------
+# SECTION 8: CREATE MOUNT POINT, MOUNT DISK, SET SYSTEMD ORDERING
+# -----------------------------------------------------------------------------
+
+- name: Create Grafana data directory if it does not exist
+  ansible.builtin.file:
+    path: "{{ grafana_data_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Mount data disk to Grafana data directory
+  ansible.builtin.mount:
+    path: "{{ grafana_data_path }}"
+    src: "UUID={{ grafana_disk_uuid }}"
+    fstype: ext4
+    opts: defaults
+    state: mounted
+
+- name: Create Grafana systemd override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/grafana-server.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Ensure Grafana waits for data disk mount
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/grafana-server.service.d/mount-order.conf
+    content: |
+      [Unit]
+      After=var-lib-grafana.mount
+      Requires=var-lib-grafana.mount
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Restart grafana
+
+# -----------------------------------------------------------------------------
+# SECTION 9: RESTORE CONFIG FROM DISK
+# -----------------------------------------------------------------------------
+
+- name: Restore Grafana config files from data disk to /etc/grafana
+  ansible.builtin.copy:
+    src: "{{ grafana_data_path }}/etc-grafana/"
+    dest: "{{ grafana_config_path }}/"
+    owner: root
+    group: grafana
+    mode: preserve
+    remote_src: true
+
+# -----------------------------------------------------------------------------
+# SECTION 10: FIX OWNERSHIP
+# -----------------------------------------------------------------------------
+
+- name: Set correct ownership on Grafana data directory
+  ansible.builtin.file:
+    path: "{{ grafana_data_path }}"
+    owner: grafana
+    group: grafana
+    recurse: true
+
+# -----------------------------------------------------------------------------
+# SECTION 11: ADMIN CREDENTIALS
+# -----------------------------------------------------------------------------
+
+- name: Write admin credentials to systemd override file
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/grafana-server.service.d/credentials.conf
+    content: |
+      # Managed by Ansible — do not edit manually
+      [Service]
+      Environment="GF_SECURITY_ADMIN_USER={{ grafana_admin_user }}"
+      Environment="GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}"
+    owner: root
+    group: root
+    mode: '0600'
+  notify: Restart grafana
+
+- name: Reload systemd to pick up overrides
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# -----------------------------------------------------------------------------
+# SECTION 12: START SERVICE
+# -----------------------------------------------------------------------------
+
+- name: Enable and start Grafana service
+  ansible.builtin.systemd:
+    name: grafana-server
+    enabled: true
+    state: started
+
+# -----------------------------------------------------------------------------
+# SECTION 13: VERIFY
+# -----------------------------------------------------------------------------
+
+- name: Verify Grafana is running
+  ansible.builtin.systemd:
+    name: grafana-server
+  register: grafana_status
+  failed_when: grafana_status.status.ActiveState != "active"
+
+# -----------------------------------------------------------------------------
+# SECTION 14: SETUP GRAFANA PASSWORD
+# -----------------------------------------------------------------------------
+
+- name: Reset Grafana admin password via CLI
+  ansible.builtin.command: >
+    grafana-cli --homepath /usr/share/grafana
+    admin reset-admin-password {{ grafana_admin_password }}
+  changed_when: true
+# -----------------------------------------------------------------------------
+# SECTION 15: SHELL SCRIPTS
+# -----------------------------------------------------------------------------
+
+- name: Install Grafana config backup script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/backuptodisk
+    content: |
+      #!/bin/bash
+      echo "Syncing Grafana config to persistent disk..."
+      rsync -a /etc/grafana/ /var/lib/grafana/etc-grafana/
+      echo "Done. Changes will survive the next VM rebuild."
+    owner: root
+    group: root
+    mode: '0755'

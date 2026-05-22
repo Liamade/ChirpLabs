@@ -1,0 +1,172 @@
+# Runs Ansible against all provisioned VMs. Fetches vm_info.json from MinIO to
+# build a dynamic inventory at runtime — hosts.ini is never committed to the repo.
+#
+# Required Forgejo secrets:
+#   ANSIBLE_SSH_PRIVATE_KEY   Private half of ansible_ed25519 keypair
+#   MINIO_ACCESS_KEY          MinIO access key
+#   MINIO_SECRET_KEY          MinIO secret key
+#   CTADMIN_USER_PASSWORD     Password for the ctadmin admin user
+#   GRAFANA_ADMIN_PASSWORD    Grafana admin password
+#   WAZUH_API_PASSWORD        Wazuh API password
+#   WAZUH_INDEXER_PASSWORD    Wazuh indexer password
+#   WAZUH_DASHBOARD_PASSWORD  Wazuh dashboard password
+#   GRAYLOG_PASSWORD_SECRET   Graylog pepper secret
+#   GRAYLOG_ROOT_PASSWORD_SHA2 Graylog root password hash
+#   SHUFFLE_OPENSEARCH_PASSWORD Shuffle OpenSearch password
+#
+# Required Forgejo variables:
+#   MINIO_ENDPOINT            MinIO endpoint (e.g. http://<minio-host>:9000)
+#   MINIO_BUCKET              MinIO bucket name
+
+name: Ansible
+
+on:
+
+  # Big Deploy trigger (doesn't run without it)
+  workflow_call:
+
+  # Manual trigger — use this during development so you can run on demand
+  workflow_dispatch:
+
+  # Automatically run when Ansible files change on main
+  push:
+    branches:
+      - main
+    paths:
+      - 'ansible/**'
+
+jobs:
+  configure:
+    name: Configure VMs
+    runs-on: chirplabs
+
+    steps:
+
+      # ── 1. CHECKOUT ──────────────────────────────────────────────────────────
+      # Pull the repo so we have the playbooks, roles, and group_vars
+      - name: Checkout repository
+        run: |
+          git clone ${{ github.server_url }}/${{ github.repository }} .
+
+
+
+      # ── 3. FETCH VM INFO FROM MINIO ──────────────────────────────────────────
+      # Download vm_info.json — this is the handoff from Terraform.
+      # It contains every VM's IP address and role, which we use to
+      # build the inventory in the next step.
+      - name: Fetch vm_info.json from MinIO
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+        run: |
+          curl -s -k \
+            --aws-sigv4 "aws:amz:local:s3" \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+            "${{ vars.MINIO_ENDPOINT }}/${{ vars.MINIO_BUCKET }}/vm_info.json" \
+            -o vm_info.json
+
+          echo "=== VM info fetched ==="
+          cat vm_info.json
+
+      # ── 4. GENERATE INVENTORY ────────────────────────────────────────────────
+      # Build hosts.ini dynamically from vm_info.json.
+      # VMs are grouped by their 'role' field — each role maps to a
+      # host group which maps to a play in the playbook.
+      # This file is never committed to Git — always generated fresh.
+      - name: Generate Ansible inventory (hosts.ini)
+        run: |
+          python3 -c "
+          import json
+          from collections import defaultdict
+
+          with open('vm_info.json') as f:
+              vms = json.load(f)
+
+          groups = defaultdict(list)
+          for name, info in vms.items():
+              groups[info['role']].append((name, info['ip']))
+
+          # SSH connection args applied to every host
+          conn = (
+              'ansible_user=ubuntu '
+              'ansible_ssh_private_key_file=~/.ssh/ansible_ed25519 '
+              'ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\"'
+          )
+
+          with open('ansible/hosts.ini', 'w') as f:
+              for role, hosts in groups.items():
+                  f.write(f'[{role}]\n')
+                  for name, ip in hosts:
+                      f.write(f'{ip} {conn}\n')
+                  f.write('\n')
+
+              f.write('[vms:children]\n')
+              for role in groups:
+                  f.write(f'{role}\n')
+          "
+
+
+
+      - name: Clear known_hosts on runner
+        run: |
+          rm -f ~/.ssh/known_hosts
+
+          
+      # ── 5. SET UP SSH KEY ────────────────────────────────────────────────────
+      # Write the Ansible SSH private key to the runner's ~/.ssh directory.
+      # This is the ansible_ed25519 key whose public half was baked into
+      # the golden image by Packer — it's how Ansible gets into every VM.
+      - name: Set up Ansible SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo '${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}' > ~/.ssh/ansible_ed25519
+          chmod 600 ~/.ssh/ansible_ed25519
+
+      # ── 6. RUN PLAYBOOKS ─────────────────────────────────────────────────────
+      # Run all playbooks. Each playbook targets a specific host group.
+      # Grafana admin password is injected here from Forgejo secrets
+      # so it never touches the repo or group_vars in plaintext.
+
+      - name: Run common playbook (all VMs)   # playbook for every vm
+        working-directory: ansible
+        run: |
+          ansible-playbook -i hosts.ini playbooks/common.yml \
+            -e 'ctadmin_user_password=${{ secrets.CTADMIN_USER_PASSWORD }}'
+
+      # Run Monitoring Playbook
+      - name: Run monitoring playbook (Grafana, Nagios)
+        working-directory: ansible
+        run: |
+          ansible-playbook -i hosts.ini playbooks/monitoring.yml \
+            -e 'grafana_admin_password=${{ secrets.GRAFANA_ADMIN_PASSWORD }}'
+        # -e passes the password as an extra variable at runtime
+        # This overrides the vault_grafana_admin_password placeholder
+        # in group_vars/grafana.yml without storing it anywhere in the repo
+
+
+      # Run SecMonDock Playbook
+      - name: Run SecMonDock VM playbook
+        working-directory: ansible
+        run: |
+          ansible-playbook -i hosts.ini playbooks/secmondock.yml \
+            -e 'wazuh_api_password=${{ secrets.WAZUH_API_PASSWORD }}' \
+            -e 'wazuh_indexer_password=${{ secrets.WAZUH_INDEXER_PASSWORD }}' \
+            -e 'wazuh_dashboard_password=${{ secrets.WAZUH_DASHBOARD_PASSWORD }}' \
+            -e 'graylog_password_secret=${{ secrets.GRAYLOG_PASSWORD_SECRET }}' \
+            -e 'graylog_root_password_sha2=${{ secrets.GRAYLOG_ROOT_PASSWORD_SHA2 }}' \
+            -e 'shuffle_opensearch_password=${{ secrets.SHUFFLE_OPENSEARCH_PASSWORD }}' \
+            -e 'shuffle_encryption_modifier=${{ secrets.SHUFFLE_ENCRYPTION_MODIFIER }}' \ 
+
+      # ── 7. CLEANUP ───────────────────────────────────────────────────────────
+      # Always remove the SSH key from the runner — even if the job failed.
+      # if: always() ensures this runs regardless of what happened above.
+      # Never leave credentials sitting on the runner between jobs.
+      - name: Remove Ansible SSH key from runner
+        if: always()
+        run: rm -f ~/.ssh/ansible_ed25519
+
+
+
+
+
+

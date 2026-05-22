@@ -1,0 +1,210 @@
+services:
+  mongodb:
+    image: mongo:7.0
+    restart: on-failure
+    networks:
+      - graylog
+    volumes:
+      - /mnt/data/graylog/mongodb:/data/db
+      - /mnt/data/graylog/mongodb-config:/data/configdb
+
+  datanode:
+    image: ${DATANODE_IMAGE:-graylog/graylog-datanode:7.0}
+    hostname: datanode
+    restart: on-failure
+    environment:
+      GRAYLOG_DATANODE_OPENSEARCH_HEAP: 22g
+      GRAYLOG_DATANODE_NODE_ID_FILE: "/var/lib/graylog-datanode/node-id"
+      GRAYLOG_DATANODE_PASSWORD_SECRET: "${GRAYLOG_PASSWORD_SECRET:?Please configure GRAYLOG_PASSWORD_SECRET in the .env file}"
+      GRAYLOG_DATANODE_MONGODB_URI: "mongodb://mongodb:27017/graylog"
+      GRAYLOG_DATANODE_OPENSEARCH_SECURITY_ENABLED: "false"
+    ulimits:
+      memlock:
+        hard: -1
+        soft: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "8999:8999"
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - graylog
+    volumes:
+      - /mnt/data/graylog/datanode:/var/lib/graylog-datanode
+
+  graylog:
+    hostname: server
+    image: ${GRAYLOG_IMAGE:-graylog/graylog:7.0}
+    depends_on:
+      mongodb:
+        condition: service_started
+      datanode:
+        condition: service_started
+    entrypoint: /bin/bash -c "keytool -importcert -alias graylog-ca -file /usr/share/graylog/certs/rootCA.crt -keystore /opt/java/openjdk/lib/security/cacerts -storepass changeit -noprompt; /docker-entrypoint.sh"
+    environment:
+      GRAYLOG_NODE_ID_FILE: "/usr/share/graylog/data/data/node-id"
+      GRAYLOG_PASSWORD_SECRET: "${GRAYLOG_PASSWORD_SECRET:?Please configure GRAYLOG_PASSWORD_SECRET in the .env file}"
+      GRAYLOG_ROOT_PASSWORD_SHA2: "${GRAYLOG_ROOT_PASSWORD_SHA2:?Please configure GRAYLOG_ROOT_PASSWORD_SHA2 in the .env file}"
+      GRAYLOG_HTTP_BIND_ADDRESS: "0.0.0.0:9000"
+      GRAYLOG_HTTP_EXTERNAL_URI: "https://{{ inventory_hostname }}:9000/"
+      GRAYLOG_MONGODB_URI: "mongodb://mongodb:27017/graylog"
+      GRAYLOG_PROMETHEUS_EXPORTER_ENABLED: "true"
+      GRAYLOG_PROMETHEUS_EXPORTER_BIND_ADDRESS: "0.0.0.0:9833"
+    ports:
+      - "0.0.0.0:5044:5044"
+      - "127.0.0.1:5140:5140/udp"
+      - "127.0.0.1:5140:5140/tcp"
+      - "127.0.0.1:5555:5555/tcp"
+      - "127.0.0.1:5555:5555/udp"
+      - "9000:9000"
+      - "9833:9833"
+      - "127.0.0.1:12201:12201/tcp"
+      - "12201:12201/udp"
+      - "127.0.0.1:13301:13301/tcp"
+      - "127.0.0.1:13302:13302/tcp"
+    networks:
+      - graylog
+    volumes:
+      - /mnt/data/graylog/data:/usr/share/graylog/data
+      - /mnt/data/graylog/certs:/usr/share/graylog/certs:ro
+    restart: on-failure
+
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.14.4
+    hostname: wazuh.manager
+    restart: always
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    ports:
+      - "1516:1516"
+      - "1515:1515"
+      - "514:514/udp"
+      - "55000:55000"
+    environment:
+      - WAZUH_INDEXER_ENABLED=true
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD={{ wazuh_indexer_password }}
+      - FILEBEAT_SSL_VERIFICATION_MODE=certificate
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD={{ wazuh_api_password }}
+    volumes:
+      - /mnt/data/wazuh/manager/api-config:/var/ossec/api/configuration
+      - /mnt/data/wazuh/manager/etc:/var/ossec/etc
+      - /mnt/data/wazuh/manager/logs:/var/ossec/logs
+      - /mnt/data/wazuh/manager/queue:/var/ossec/queue
+      - /mnt/data/wazuh/manager/integrations:/var/ossec/integrations
+      - /mnt/data/wazuh/manager/active-response:/var/ossec/active-response/bin
+      - /mnt/data/wazuh/manager/agentless:/var/ossec/agentless
+      - /mnt/data/wazuh/manager/wodles:/var/ossec/wodles
+      - /mnt/data/wazuh/indexer/ssl-certs/root-ca-manager.pem:/etc/ssl/root-ca.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.manager.pem:/etc/ssl/filebeat.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.manager-key.pem:/etc/ssl/filebeat.key
+      - /mnt/data/wazuh/integration-scripts/scripts:/var/ossec/integrations
+    networks:
+      - graylog
+
+  wazuh-exporter:
+    image: kennyopennix/wazuh-exporter:latest
+    container_name: wazuh-exporter
+    restart: unless-stopped
+    environment:
+      WAZUH_API_HOST: wazuh.manager
+      WAZUH_API_PORT: 55000
+      WAZUH_API_USERNAME: wazuh-wui
+      WAZUH_API_PASSWORD: {{ wazuh_api_password }}
+      EXPORTER_PORT: 8900
+    ports:
+      - "8900:8900"
+    depends_on:
+      - wazuh.manager
+    entrypoint: ["/bin/sh", "-c", "sleep 30 && python ./main.py"]
+    networks:
+      - graylog
+
+  wazuh.indexer:
+    image: wazuh/wazuh-indexer:4.14.4
+    hostname: wazuh.indexer
+    restart: always
+    ports:
+      - "9201:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - /mnt/data/wazuh/indexer/data:/var/lib/wazuh-indexer
+      - /mnt/data/wazuh/indexer/ssl-certs/root-ca.pem:/usr/share/wazuh-indexer/config/certs/root-ca.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.indexer-key.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.key
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.indexer.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/admin.pem:/usr/share/wazuh-indexer/config/certs/admin.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/admin-key.pem:/usr/share/wazuh-indexer/config/certs/admin-key.pem
+      - /mnt/data/wazuh/indexer/config/opensearch.yml:/usr/share/wazuh-indexer/config/opensearch.yml
+      - /mnt/data/wazuh/indexer/config/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml
+    networks:
+      - graylog
+
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.14.4
+    hostname: wazuh.dashboard
+    restart: always
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD={{ wazuh_indexer_password }}
+      - WAZUH_API_URL=https://wazuh.manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD={{ wazuh_dashboard_password }}
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD={{ wazuh_api_password }}
+    volumes:
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/wazuh.dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem
+      - /mnt/data/wazuh/indexer/ssl-certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem
+      - /mnt/data/wazuh/dashboard/config-files/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml
+      - /mnt/data/wazuh/dashboard/config-files/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+      - /mnt/data/wazuh/dashboard/config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - /mnt/data/wazuh/dashboard/custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    depends_on:
+      - wazuh.indexer
+    networks:
+      - graylog
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.12.2
+    container_name: wazuh-filebeat
+    user: root
+    restart: unless-stopped
+    volumes:
+      - /opt/services/secmondock/security-core/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /mnt/data/wazuh/manager/logs:/var/ossec/logs:ro
+      - /mnt/data/wazuh/filebeat-var:/var/lib/filebeat
+    depends_on:
+      - wazuh.manager
+    networks:
+      - graylog
+
+
+
+networks:
+  graylog:
+    driver: bridge
+
+
+
+
+    
