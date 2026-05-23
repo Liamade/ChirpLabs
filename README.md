@@ -2,7 +2,7 @@
 
 > **Infrastructure is disposable. Data is not.**
 
-ChirpLabs is the cybersecurity operations lab at Ball State University. This repository is the complete infrastructure-as-code stack for the environment — everything needed to go from bare Proxmox nodes to a fully running security lab, from scratch, with one pipeline trigger.
+ChirpLabs is a student hosting service at Ball State University. This repository is the complete infrastructure-as-code stack for the environment — everything needed to go from bare Proxmox nodes to a fully running security lab, from scratch, with one pipeline trigger.
 
 ---
 
